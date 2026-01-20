@@ -8,67 +8,50 @@ import io
 import json
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, time as dtime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
 
-try:
-    from zoneinfo import ZoneInfo  # py3.9+
-except Exception:
-    ZoneInfo = None  # type: ignore
+# =========================
+# API config (uses https://www.metaculus.com/api/)
+# =========================
+BASE_API = "https://www.metaculus.com/api"
+POSTS_URL = f"{BASE_API}/posts/"
+COMMENTS_URL = f"{BASE_API}/comments/"
 
-
-# -----------------------------
-# Config (single endpoints)
-# -----------------------------
-BASE = "https://www.metaculus.com"
-POSTS_URL = f"{BASE}/api/posts/"
-COMMENTS_URL = f"{BASE}/api/comments/"
-
-POSTS_PAGE_SIZE = 100
-
-COMMENTS_PAGE_SIZE = 200   # pagination size for /api/comments
-MAX_COMMENT_PAGES_PER_POST = 200  # safety cap: 200 * 200 = 40k comments/post max
+POSTS_PAGE_SIZE_DEFAULT = 100
+COMMENTS_PAGE_SIZE_DEFAULT = 200
 
 REQUEST_TIMEOUT_S = 30
 MAX_RETRIES = 5
-SLEEP_S = 0.12
 
 
-# -----------------------------
+# =========================
 # Helpers
-# -----------------------------
+# =========================
 def auth_headers(token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Token {token}",
         "Accept": "application/json",
-        "User-Agent": "metaculus-scan-n-posts-then-sort/1.0",
+        "User-Agent": "metaculus-streamlit-posts-comments/1.0",
     }
 
 
-def parse_iso(dt: str) -> datetime:
-    # "2026-01-17T16:29:01.551Z" -> aware
-    if dt.endswith("Z"):
-        dt = dt[:-1] + "+00:00"
-    return datetime.fromisoformat(dt)
-
-
-def to_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def request_json(session: requests.Session, url: str, headers: Dict[str, str], params: Dict[str, Any]) -> Dict[str, Any]:
+def request_json(
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    params: Dict[str, Any],
+    sleep_s: float,
+) -> Any:
     last_err: Optional[str] = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = session.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_S)
 
             if r.status_code in (401, 403):
-                raise RuntimeError(f"Auth failed (HTTP {r.status_code}). Check token. Body: {r.text[:200]}")
+                raise RuntimeError(f"Auth failed (HTTP {r.status_code}). Body: {r.text[:200]}")
 
             if r.status_code in (429, 502, 503, 504):
                 time.sleep(min(2**attempt, 16))
@@ -79,7 +62,6 @@ def request_json(session: requests.Session, url: str, headers: Dict[str, str], p
                 raise RuntimeError(f"{url} -> HTTP {r.status_code} {r.text[:200]}")
 
             return r.json()
-
         except Exception as e:
             last_err = str(e)
             time.sleep(min(2**attempt, 16))
@@ -95,40 +77,23 @@ def extract_results(payload: Any) -> List[Dict[str, Any]]:
     raise RuntimeError("Unexpected payload shape (no results list).")
 
 
-def get_post_id(post_obj: Dict[str, Any]) -> Optional[int]:
-    v = post_obj.get("id")
-    return v if isinstance(v, int) else None
+def safe_post_title(p: Dict[str, Any]) -> str:
+    # Metaculus may use different keys depending on post type; be defensive
+    for k in ("title", "question", "name", "headline"):
+        v = p.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
 
 
-def normalize_comment_row(post_id: int, c: Dict[str, Any]) -> Dict[str, Any]:
-    author = c.get("author") if isinstance(c.get("author"), dict) else {}
-    return {
-        "post_id": post_id,
-        "comment_id": c.get("id"),
-        "created_at": c.get("created_at"),
-        "author_id": author.get("id") if isinstance(author, dict) else None,
-        "author_username": author.get("username") if isinstance(author, dict) else None,
-        "vote_score": c.get("vote_score"),
-        "parent_id": c.get("parent_id"),
-        "root_id": c.get("root_id"),
-        "text": c.get("text"),
-        "raw_json": json.dumps(c, ensure_ascii=False),
-    }
+def truncate(s: Any, n: int = 220) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.replace("\r", " ").replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def build_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
-    fieldnames = [
-        "post_id",
-        "comment_id",
-        "created_at",
-        "author_id",
-        "author_username",
-        "vote_score",
-        "parent_id",
-        "root_id",
-        "text",
-        "raw_json",
-    ]
+def build_csv_bytes(rows: List[Dict[str, Any]], fieldnames: List[str]) -> bytes:
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=fieldnames)
     w.writeheader()
@@ -137,309 +102,441 @@ def build_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     return buf.getvalue().encode("utf-8-sig")
 
 
-# -----------------------------
-# Core logic
-# -----------------------------
+# =========================
+# Fetch logic
+# =========================
 @dataclass
-class Stats:
-    posts_target: int = 0
-    posts_collected: int = 0
-    posts_scanned_for_comments: int = 0
+class RunStats:
+    posts_requested: int = 0
+    posts_fetched: int = 0
     comment_pages_fetched: int = 0
     comments_seen: int = 0
     comments_unique: int = 0
 
 
-def collect_n_post_ids(session: requests.Session, headers: Dict[str, str], n_posts: int) -> List[int]:
-    post_ids: List[int] = []
-    offset = 0
-
-    while len(post_ids) < n_posts:
-        payload = request_json(session, POSTS_URL, headers, {"limit": POSTS_PAGE_SIZE, "offset": offset})
-        posts = extract_results(payload)
-        if not posts:
-            break
-
-        for p in posts:
-            pid = get_post_id(p)
-            if pid is not None:
-                post_ids.append(pid)
-                if len(post_ids) >= n_posts:
-                    break
-
-        offset += POSTS_PAGE_SIZE
-        time.sleep(SLEEP_S)
-
-    # de-dup while preserving order (defensive)
-    seen: Set[int] = set()
-    out: List[int] = []
-    for pid in post_ids:
-        if pid not in seen:
-            seen.add(pid)
-            out.append(pid)
-    return out[:n_posts]
-
-
-def fetch_all_comments_for_post(
+def fetch_posts_range(
     session: requests.Session,
     headers: Dict[str, str],
-    post_id: int,
-    stats: Stats,
+    start_index: int,
+    end_index: int,
+    posts_page_size: int,
+    sleep_s: float,
+    progress_cb=None,
 ) -> List[Dict[str, Any]]:
-    all_comments: List[Dict[str, Any]] = []
-    offset = 0
+    """
+    Fetch posts in the "raw" index range [start_index, end_index) using offset/limit paging.
+    We try order_by=-activity_at and fall back to no ordering if the backend rejects it.
+    """
+    assert 0 <= start_index < end_index
+    needed = end_index - start_index
+    out: List[Dict[str, Any]] = []
+    offset = start_index
+    use_order_by = True
 
-    for _ in range(MAX_COMMENT_PAGES_PER_POST):
-        params = {
-            "post": post_id,
-            "limit": COMMENTS_PAGE_SIZE,
-            "offset": offset,
-            "sort": "-created_at",      # stable and efficient; still we will sort globally later
-            "is_private": "false",
-        }
-        payload = request_json(session, COMMENTS_URL, headers, params)
-        stats.comment_pages_fetched += 1
+    while len(out) < needed:
+        limit = min(posts_page_size, needed - len(out))
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if use_order_by:
+            params["order_by"] = "-activity_at"
+
+        try:
+            payload = request_json(session, POSTS_URL, headers, params, sleep_s)
+        except RuntimeError as e:
+            msg = str(e)
+            if use_order_by and ("order_by" in msg or "activity_at" in msg or "400" in msg):
+                use_order_by = False
+                continue
+            raise
 
         chunk = extract_results(payload)
         if not chunk:
             break
 
-        all_comments.extend(chunk)
+        out.extend(chunk)
+        offset += limit
+        if progress_cb:
+            progress_cb(len(out), needed, phase="posts")
+
+        time.sleep(sleep_s)
+
+    return out[:needed]
+
+
+def fetch_comments_for_post(
+    session: requests.Session,
+    headers: Dict[str, str],
+    post_id: int,
+    mode: str,
+    page_size: int,
+    max_pages: int,
+    sleep_s: float,
+    slice_start: int,
+    slice_end: int,
+    stats: RunStats,
+    per_page_cb=None,
+) -> List[Dict[str, Any]]:
+    """
+    mode:
+      - "preview" -> fetch only the first page (offset=0, limit=page_size)
+      - "all"     -> paginate until empty (cap max_pages)
+      - "slice"   -> fetch exactly offsets [slice_start, slice_end) in one shot (best-effort), no pagination
+    Robustness:
+      - tries "post" and "post_id"
+      - tries "sort" and "order_by" for created_at desc
+      - avoids sending is_private=false (can cause unexpected filtering on some backends)
+    """
+    base_variants = [{"post": post_id}, {"post_id": post_id}, {"post": str(post_id)}, {"post_id": str(post_id)}]
+    order_variants = [{"sort": "-created_at"}, {"order_by": "-created_at"}, {}]
+
+    # pick variant that at least returns a valid response
+    chosen_base: Optional[Dict[str, Any]] = None
+    chosen_order: Optional[Dict[str, Any]] = None
+
+    for b in base_variants:
+        for o in order_variants:
+            probe_params = {"limit": 1, "offset": 0}
+            probe_params.update(b)
+            probe_params.update(o)
+            try:
+                payload = request_json(session, COMMENTS_URL, headers, probe_params, sleep_s)
+                _ = extract_results(payload)
+                chosen_base, chosen_order = b, o
+                break
+            except Exception:
+                continue
+        if chosen_base is not None:
+            break
+
+    if chosen_base is None or chosen_order is None:
+        return []
+
+    comments: List[Dict[str, Any]] = []
+
+    if mode == "slice":
+        if slice_end <= slice_start:
+            return []
+        limit = min(page_size, slice_end - slice_start) if (slice_end - slice_start) > page_size else (slice_end - slice_start)
+        params = {"limit": limit, "offset": slice_start}
+        params.update(chosen_base)
+        params.update(chosen_order)
+        payload = request_json(session, COMMENTS_URL, headers, params, sleep_s)
+        chunk = extract_results(payload)
+        stats.comment_pages_fetched += 1
         stats.comments_seen += len(chunk)
-
-        offset += COMMENTS_PAGE_SIZE
-        time.sleep(SLEEP_S)
-
-    return all_comments
-
-
-def apply_cutoff(comments: List[Tuple[int, Dict[str, Any]]], cutoff_utc: Optional[datetime]) -> List[Tuple[int, Dict[str, Any]]]:
-    if cutoff_utc is None:
+        comments.extend(chunk)
+        if per_page_cb:
+            per_page_cb(post_id, 1, len(chunk), done=True)
         return comments
 
-    out: List[Tuple[int, Dict[str, Any]]] = []
-    for post_id, c in comments:
-        ca = c.get("created_at")
-        if not isinstance(ca, str):
-            continue
-        try:
-            created_utc = to_utc(parse_iso(ca))
-        except Exception:
-            continue
-        if created_utc >= cutoff_utc:
-            out.append((post_id, c))
+    if mode == "preview":
+        params = {"limit": page_size, "offset": 0}
+        params.update(chosen_base)
+        params.update(chosen_order)
+        payload = request_json(session, COMMENTS_URL, headers, params, sleep_s)
+        chunk = extract_results(payload)
+        stats.comment_pages_fetched += 1
+        stats.comments_seen += len(chunk)
+        comments.extend(chunk)
+        if per_page_cb:
+            per_page_cb(post_id, 1, len(chunk), done=True)
+        return comments
+
+    # mode == "all"
+    offset = 0
+    for page_idx in range(1, max_pages + 1):
+        params = {"limit": page_size, "offset": offset}
+        params.update(chosen_base)
+        params.update(chosen_order)
+
+        payload = request_json(session, COMMENTS_URL, headers, params, sleep_s)
+        chunk = extract_results(payload)
+
+        stats.comment_pages_fetched += 1
+        stats.comments_seen += len(chunk)
+
+        if not chunk:
+            if per_page_cb:
+                per_page_cb(post_id, page_idx, 0, done=True)
+            break
+
+        comments.extend(chunk)
+        offset += page_size
+
+        if per_page_cb:
+            per_page_cb(post_id, page_idx, len(chunk), done=False)
+
+        time.sleep(sleep_s)
+
+    return comments
+
+
+# =========================
+# Streamlit app
+# =========================
+st.set_page_config(page_title="Metaculus: Posts + Comments (API)", layout="wide")
+st.title("Metaculus — Posts & Comments (via https://www.metaculus.com/api/)")
+
+with st.sidebar:
+    st.header("Auth")
+    token = st.text_input("Metaculus API token", type="password", help="Required for authenticated API access.")
+
+    st.header("Posts selection (raw index range)")
+    start_idx = st.number_input("Start index (inclusive)", min_value=0, value=0, step=1,
+                                help="Example: 20 to start at 'raw post #20'.")
+    end_idx = st.number_input("End index (exclusive)", min_value=1, value=40, step=1,
+                              help="Example: 40 to end at 'raw post #39'.")
+    posts_page_size = st.number_input("Posts page size", min_value=10, max_value=100, value=100, step=10)
+
+    st.header("Comments mode")
+    mode = st.selectbox(
+        "How to fetch comments per post?",
+        options=["preview", "all", "slice"],
+        index=0,
+        help=(
+            "preview: 1 page per post\n"
+            "all: paginate all pages (capped)\n"
+            "slice: fetch a specific offset range per post (e.g., comments #20 to #40)"
+        ),
+    )
+    comments_page_size = st.number_input("Comments page size", min_value=20, max_value=500, value=200, step=20)
+    max_comment_pages = st.number_input("Max comment pages per post (only for 'all')", min_value=1, max_value=500, value=50, step=10)
+
+    st.subheader("Comment slice (only for 'slice')")
+    c_slice_start = st.number_input("Comment slice start (offset)", min_value=0, value=0, step=1)
+    c_slice_end = st.number_input("Comment slice end (exclusive)", min_value=1, value=20, step=1)
+
+    st.header("Performance / rate-limit")
+    sleep_s = st.slider("Sleep between requests (seconds)", min_value=0.0, max_value=1.0, value=0.12, step=0.02)
+
+    st.header("UI")
+    preview_posts_rows = st.number_input("Posts preview rows", min_value=5, max_value=200, value=50, step=5)
+    preview_comments_rows = st.number_input("Comments preview rows per post", min_value=3, max_value=50, value=8, step=1)
+
+    st.header("Export")
+    include_raw_json = st.checkbox("Include raw_json column in comments CSV", value=False)
+
+
+run = st.button("Run", type="primary", use_container_width=True)
+
+# Containers for live progress
+posts_progress = st.progress(0, text="Posts: waiting…")
+comments_progress = st.progress(0, text="Comments: waiting…")
+status = st.empty()
+
+posts_table_ph = st.empty()
+summary_ph = st.empty()
+
+# Holders for per-post comment previews (live)
+per_post_containers: Dict[int, Tuple[st.delta_generator.DeltaGenerator, st.delta_generator.DeltaGenerator]] = {}
+
+
+def posts_progress_cb(done: int, total: int, phase: str) -> None:
+    pct = int(min(done / max(total, 1), 1.0) * 100)
+    posts_progress.progress(pct, text=f"Posts: {done}/{total} fetched")
+
+
+def comments_page_cb(post_id: int, page_idx: int, n_in_page: int, done: bool) -> None:
+    # Just a small per-post status line; global progress handled elsewhere.
+    if post_id in per_post_containers:
+        stat_ph, _ = per_post_containers[post_id]
+        tail = "done" if done else "…"
+        stat_ph.write(f"Comments: page {page_idx} (+{n_in_page}) {tail}")
+
+
+def normalize_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for i, p in enumerate(posts):
+        pid = p.get("id")
+        out.append({
+            "idx_in_range": i,
+            "post_id": pid,
+            "title": safe_post_title(p),
+        })
     return out
 
 
-def sort_by_created_desc(comments: List[Tuple[int, Dict[str, Any]]]) -> List[Tuple[int, Dict[str, Any]]]:
-    def key_fn(item: Tuple[int, Dict[str, Any]]) -> datetime:
-        ca = item[1].get("created_at")
-        if isinstance(ca, str):
-            try:
-                return to_utc(parse_iso(ca))
-            except Exception:
-                return datetime.min.replace(tzinfo=timezone.utc)
-        return datetime.min.replace(tzinfo=timezone.utc)
-
-    return sorted(comments, key=key_fn, reverse=True)
-
-
-def scan_n_posts_then_sort(
-    token: str,
-    target_n_comments: int,
-    cutoff_utc: Optional[datetime],
-    progress_cb=None,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Stats]:
-    """
-    Algorithm requested:
-    1) collect exactly N post_ids (N = desired comments count)
-    2) fetch ALL comments for each of these posts (pagination)
-    3) aggregate comments, de-dup by comment_id
-    4) sort globally by created_at desc
-    5) outputs:
-       - top_n (after optional cutoff): min(N, #after_cutoff) most recent
-       - after_cutoff_all: all comments after cutoff (or all if cutoff disabled), sorted desc
-    """
-    headers = auth_headers(token)
-    session = requests.Session()
-    stats = Stats(posts_target=target_n_comments)
-
-    post_ids = collect_n_post_ids(session, headers, n_posts=target_n_comments)
-    stats.posts_collected = len(post_ids)
-
-    # Fetch all comments for each post
-    paired: List[Tuple[int, Dict[str, Any]]] = []
-    for idx, pid in enumerate(post_ids, start=1):
-        stats.posts_scanned_for_comments += 1
-        try:
-            comments = fetch_all_comments_for_post(session, headers, pid, stats)
-        except Exception:
-            time.sleep(SLEEP_S)
-            comments = []
-        for c in comments:
-            paired.append((pid, c))
-
-        if progress_cb:
-            progress_cb(idx, len(post_ids), stats)
-
-    # De-dup by comment_id (sitewide)
-    seen_cids: Set[int] = set()
-    deduped: List[Tuple[int, Dict[str, Any]]] = []
-    for pid, c in paired:
-        cid = c.get("id")
-        if not isinstance(cid, int):
-            continue
-        if cid in seen_cids:
-            continue
-        seen_cids.add(cid)
-        deduped.append((pid, c))
-    stats.comments_unique = len(deduped)
-
-    # Cutoff then sort
-    after_cutoff = apply_cutoff(deduped, cutoff_utc)
-    after_cutoff_sorted = sort_by_created_desc(after_cutoff)
-
-    # Top-N after cutoff (or top-N overall if cutoff disabled)
-    top_n_sorted = after_cutoff_sorted[:target_n_comments]
-
-    # Normalize rows for CSV
-    top_n_rows = [normalize_comment_row(pid, c) for pid, c in top_n_sorted]
-    after_cutoff_rows = [normalize_comment_row(pid, c) for pid, c in after_cutoff_sorted]
-
-    return top_n_rows, after_cutoff_rows, stats
-
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="Metaculus — Scan N posts, fetch all comments, sort", layout="wide")
-st.title("Metaculus: scan N posts → fetch all comments per post → sort by date → export CSV")
-
-with st.sidebar:
-    st.header("Inputs")
-    token = st.text_input("Metaculus API token", type="password")
-
-    n_comments = st.number_input(
-        "N (desired comments)",
-        min_value=1,
-        max_value=5000,
-        value=400,
-        step=50,
-        help="This app will scan exactly N posts, then fetch all comments for each scanned post.",
-    )
-
-    st.subheader("Cutoff (keep created_at >= cutoff)")
-    enable_cutoff = st.checkbox("Enable cutoff", value=True)
-
-    tz_name = st.selectbox("Timezone for cutoff input", options=["America/New_York", "Europe/Paris", "UTC"], index=0)
-    cutoff_d = st.date_input("Cutoff date", value=date.today())
-    cutoff_t = st.time_input("Cutoff time", value=dtime(0, 0))
-
-
-def compute_cutoff_utc() -> Optional[datetime]:
-    if not enable_cutoff:
-        return None
-    dt_naive = datetime.combine(cutoff_d, cutoff_t)
-    if tz_name == "UTC":
-        return dt_naive.replace(tzinfo=timezone.utc)
-    if ZoneInfo is None:
-        return dt_naive.replace(tzinfo=timezone.utc)
-    tz = ZoneInfo(tz_name)
-    return dt_naive.replace(tzinfo=tz).astimezone(timezone.utc)
-
-
-cutoff_utc = compute_cutoff_utc()
-if cutoff_utc is None:
-    st.caption("Cutoff: disabled (no filtering). Output ‘after cutoff’ == all scanned comments.")
-else:
-    st.caption(f"Cutoff (UTC): {cutoff_utc.isoformat()}")
-
-run = st.button("Run", type="primary", use_container_width=True)
-progress = st.progress(0)
-status = st.empty()
-
-if "top_n_rows" not in st.session_state:
-    st.session_state.top_n_rows = []
-if "after_cutoff_rows" not in st.session_state:
-    st.session_state.after_cutoff_rows = []
-if "stats" not in st.session_state:
-    st.session_state.stats = None
-
-
-def progress_cb(done_posts: int, total_posts: int, stats: Stats) -> None:
-    frac = min(done_posts / max(total_posts, 1), 1.0)
-    progress.progress(int(frac * 100))
-    status.write(
-        f"posts {done_posts}/{total_posts} | "
-        f"comment pages fetched={stats.comment_pages_fetched} | "
-        f"comments seen={stats.comments_seen} | unique={stats.comments_unique or '…'}"
-    )
+def normalize_comments(post_id: int, post_title: str, comments: List[Dict[str, Any]], with_raw: bool) -> List[Dict[str, Any]]:
+    out = []
+    for c in comments:
+        author = c.get("author") if isinstance(c.get("author"), dict) else {}
+        row = {
+            "post_id": post_id,
+            "post_title": post_title,
+            "comment_id": c.get("id"),
+            "created_at": c.get("created_at"),
+            "author_username": author.get("username") if isinstance(author, dict) else None,
+            "vote_score": c.get("vote_score"),
+            "parent_id": c.get("parent_id"),
+            "root_id": c.get("root_id"),
+            "text": c.get("text"),
+        }
+        if with_raw:
+            row["raw_json"] = json.dumps(c, ensure_ascii=False)
+        out.append(row)
+    return out
 
 
 if run:
     if not token.strip():
         st.error("Token is required.")
-    else:
-        progress.progress(0)
-        status.write("Starting…")
+        st.stop()
 
-        try:
-            top_n_rows, after_cutoff_rows, stats = scan_n_posts_then_sort(
-                token=token.strip(),
-                target_n_comments=int(n_comments),
-                cutoff_utc=cutoff_utc,
-                progress_cb=progress_cb,
-            )
+    if int(end_idx) <= int(start_idx):
+        st.error("End index must be > Start index.")
+        st.stop()
 
-            st.session_state.top_n_rows = top_n_rows
-            st.session_state.after_cutoff_rows = after_cutoff_rows
-            st.session_state.stats = stats
+    session = requests.Session()
+    headers = auth_headers(token.strip())
 
-            progress.progress(100)
-            st.success("Done.")
-        except Exception as e:
-            st.error(f"Run failed: {e}")
+    stats = RunStats(posts_requested=int(end_idx - start_idx))
+    status.write("Fetching posts…")
 
-stats = st.session_state.stats
-if stats is not None:
-    st.write(
-        f"Stats — posts_target={stats.posts_target}, posts_collected={stats.posts_collected}, "
-        f"posts_scanned_for_comments={stats.posts_scanned_for_comments}, "
-        f"comment_pages_fetched={stats.comment_pages_fetched}, comments_seen={stats.comments_seen}, "
-        f"comments_unique={stats.comments_unique}"
+    try:
+        posts = fetch_posts_range(
+            session=session,
+            headers=headers,
+            start_index=int(start_idx),
+            end_index=int(end_idx),
+            posts_page_size=int(posts_page_size),
+            sleep_s=float(sleep_s),
+            progress_cb=posts_progress_cb,
+        )
+    except Exception as e:
+        st.error(f"Failed to fetch posts: {e}")
+        st.stop()
+
+    stats.posts_fetched = len(posts)
+
+    posts_norm = normalize_posts(posts)
+    posts_table_ph.dataframe(posts_norm[: int(preview_posts_rows)], use_container_width=True)
+    posts_progress.progress(100, text=f"Posts: {len(posts)}/{stats.posts_requested} fetched")
+
+    status.write("Fetching comments per post…")
+
+    # Build per-post expanders & placeholders upfront (so UI is stable)
+    post_expanders: List[Tuple[int, str]] = []
+    for p in posts:
+        pid = p.get("id")
+        if not isinstance(pid, int):
+            continue
+        title = safe_post_title(p)
+        post_expanders.append((pid, title))
+
+    # Global comments collection
+    all_comments_rows: List[Dict[str, Any]] = []
+
+    total_posts = len(post_expanders)
+    done_posts = 0
+
+    for pid, title in post_expanders:
+        done_posts += 1
+        comments_progress.progress(
+            int(min(done_posts / max(total_posts, 1), 1.0) * 100),
+            text=f"Comments: {done_posts}/{total_posts} posts processed | pages={stats.comment_pages_fetched} | seen={stats.comments_seen}",
+        )
+
+        with st.expander(f"Post {pid} — {title or '(no title)'}", expanded=(done_posts <= 3)):
+            stat_ph = st.empty()
+            table_ph = st.empty()
+            per_post_containers[pid] = (stat_ph, table_ph)
+
+            # Fetch comments (preview/all/slice)
+            try:
+                comments = fetch_comments_for_post(
+                    session=session,
+                    headers=headers,
+                    post_id=pid,
+                    mode=mode,
+                    page_size=int(comments_page_size),
+                    max_pages=int(max_comment_pages),
+                    sleep_s=float(sleep_s),
+                    slice_start=int(c_slice_start),
+                    slice_end=int(c_slice_end),
+                    stats=stats,
+                    per_page_cb=comments_page_cb,
+                )
+            except Exception as e:
+                stat_ph.error(f"Failed to fetch comments for post {pid}: {e}")
+                comments = []
+
+            # Normalize + show preview
+            rows = normalize_comments(pid, title, comments, with_raw=bool(include_raw_json))
+            # de-dup globally by comment_id
+            # (keep it simple: dedup later for export; preview can show raw)
+            preview_rows = [{
+                "comment_id": r.get("comment_id"),
+                "created_at": r.get("created_at"),
+                "author_username": r.get("author_username"),
+                "vote_score": r.get("vote_score"),
+                "text_snippet": truncate(r.get("text"), 240),
+            } for r in rows[: int(preview_comments_rows)]]
+
+            stat_ph.write(f"Fetched {len(comments)} comments (mode={mode}).")
+            table_ph.dataframe(preview_rows, use_container_width=True)
+
+            all_comments_rows.extend(rows)
+
+    # Global dedup for export
+    seen = set()
+    deduped_comments: List[Dict[str, Any]] = []
+    for r in all_comments_rows:
+        cid = r.get("comment_id")
+        if cid is None:
+            continue
+        key = str(cid)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_comments.append(r)
+
+    stats.comments_unique = len(deduped_comments)
+
+    comments_progress.progress(100, text=f"Comments: done | pages={stats.comment_pages_fetched} | seen={stats.comments_seen} | unique={stats.comments_unique}")
+
+    summary_ph.info(
+        f"Done. Posts requested={stats.posts_requested}, fetched={stats.posts_fetched}. "
+        f"Comment pages fetched={stats.comment_pages_fetched}, comments seen={stats.comments_seen}, unique={stats.comments_unique}."
     )
 
-top_n_rows = st.session_state.top_n_rows or []
-after_cutoff_rows = st.session_state.after_cutoff_rows or []
+    # Exports
+    st.divider()
+    st.subheader("Exports")
 
-if top_n_rows or after_cutoff_rows:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
-    # CSV 1: Top N most recent (after cutoff if enabled)
-    top_csv = build_csv_bytes(top_n_rows)
-    top_name = f"metaculus_topN_{len(top_n_rows)}_{ts}.csv"
+    posts_fields = ["idx_in_range", "post_id", "title"]
+    posts_csv = build_csv_bytes(posts_norm, posts_fields)
     st.download_button(
-        "Download CSV — Top N most recent (after cutoff if enabled)",
-        data=top_csv,
-        file_name=top_name,
+        "Download posts.csv",
+        data=posts_csv,
+        file_name=f"metaculus_posts_{int(start_idx)}_{int(end_idx)}.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
-    # CSV 2: All after cutoff (or all scanned if cutoff disabled)
-    all_csv = build_csv_bytes(after_cutoff_rows)
-    all_name = f"metaculus_after_cutoff_{len(after_cutoff_rows)}_{ts}.csv"
+    comment_fields = [
+        "post_id",
+        "post_title",
+        "comment_id",
+        "created_at",
+        "author_username",
+        "vote_score",
+        "parent_id",
+        "root_id",
+        "text",
+    ]
+    if include_raw_json:
+        comment_fields.append("raw_json")
+
+    comments_csv = build_csv_bytes(deduped_comments, comment_fields)
     st.download_button(
-        "Download CSV — All comments after cutoff (or all scanned if cutoff disabled)",
-        data=all_csv,
-        file_name=all_name,
+        "Download comments.csv",
+        data=comments_csv,
+        file_name=f"metaculus_comments_posts_{int(start_idx)}_{int(end_idx)}_{mode}.csv",
         mime="text/csv",
         use_container_width=True,
     )
-
-    with st.expander("Preview (first 20 rows of Top N)"):
-        st.json(top_n_rows[:20], expanded=False)
 else:
-    st.info("No output yet. Click Run.")
-
+    st.caption(
+        "Tip: Pour récupérer les posts #20 à #40, mets Start=20, End=40. "
+        "Pour récupérer les commentaires #20 à #40 de chaque post, mets mode='slice' et Comment slice start=20, end=40."
+    )
 
