@@ -8,6 +8,7 @@ import io
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -34,7 +35,7 @@ def auth_headers(token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Token {token}",
         "Accept": "application/json",
-        "User-Agent": "metaculus-streamlit-posts-comments/1.0",
+        "User-Agent": "metaculus-streamlit-posts-comments/1.1",
     }
 
 
@@ -78,7 +79,6 @@ def extract_results(payload: Any) -> List[Dict[str, Any]]:
 
 
 def safe_post_title(p: Dict[str, Any]) -> str:
-    # Metaculus may use different keys depending on post type; be defensive
     for k in ("title", "question", "name", "headline"):
         v = p.get(k)
         if isinstance(v, str) and v.strip():
@@ -102,6 +102,23 @@ def build_csv_bytes(rows: List[Dict[str, Any]], fieldnames: List[str]) -> bytes:
     return buf.getvalue().encode("utf-8-sig")
 
 
+def parse_iso(dt: str) -> datetime:
+    # "2026-01-17T16:29:01.551Z" -> aware
+    if dt.endswith("Z"):
+        dt = dt[:-1] + "+00:00"
+    return datetime.fromisoformat(dt)
+
+
+def created_at_utc(row: Dict[str, Any]) -> datetime:
+    ca = row.get("created_at")
+    if isinstance(ca, str):
+        try:
+            return parse_iso(ca).astimezone(timezone.utc)
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
 # =========================
 # Fetch logic
 # =========================
@@ -123,10 +140,6 @@ def fetch_posts_range(
     sleep_s: float,
     progress_cb=None,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch posts in the "raw" index range [start_index, end_index) using offset/limit paging.
-    We try order_by=-activity_at and fall back to no ordering if the backend rejects it.
-    """
     assert 0 <= start_index < end_index
     needed = end_index - start_index
     out: List[Dict[str, Any]] = []
@@ -175,20 +188,9 @@ def fetch_comments_for_post(
     stats: RunStats,
     per_page_cb=None,
 ) -> List[Dict[str, Any]]:
-    """
-    mode:
-      - "preview" -> fetch only the first page (offset=0, limit=page_size)
-      - "all"     -> paginate until empty (cap max_pages)
-      - "slice"   -> fetch exactly offsets [slice_start, slice_end) in one shot (best-effort), no pagination
-    Robustness:
-      - tries "post" and "post_id"
-      - tries "sort" and "order_by" for created_at desc
-      - avoids sending is_private=false (can cause unexpected filtering on some backends)
-    """
     base_variants = [{"post": post_id}, {"post_id": post_id}, {"post": str(post_id)}, {"post_id": str(post_id)}]
     order_variants = [{"sort": "-created_at"}, {"order_by": "-created_at"}, {}]
 
-    # pick variant that at least returns a valid response
     chosen_base: Optional[Dict[str, Any]] = None
     chosen_order: Optional[Dict[str, Any]] = None
 
@@ -215,8 +217,8 @@ def fetch_comments_for_post(
     if mode == "slice":
         if slice_end <= slice_start:
             return []
-        limit = min(page_size, slice_end - slice_start) if (slice_end - slice_start) > page_size else (slice_end - slice_start)
-        params = {"limit": limit, "offset": slice_start}
+        limit = slice_end - slice_start
+        params = {"limit": min(page_size, limit), "offset": slice_start}
         params.update(chosen_base)
         params.update(chosen_order)
         payload = request_json(session, COMMENTS_URL, headers, params, sleep_s)
@@ -281,10 +283,8 @@ with st.sidebar:
     token = st.text_input("Metaculus API token", type="password", help="Required for authenticated API access.")
 
     st.header("Posts selection (raw index range)")
-    start_idx = st.number_input("Start index (inclusive)", min_value=0, value=0, step=1,
-                                help="Example: 20 to start at 'raw post #20'.")
-    end_idx = st.number_input("End index (exclusive)", min_value=1, value=40, step=1,
-                              help="Example: 40 to end at 'raw post #39'.")
+    start_idx = st.number_input("Start index (inclusive)", min_value=0, value=0, step=1)
+    end_idx = st.number_input("End index (exclusive)", min_value=1, value=40, step=1)
     posts_page_size = st.number_input("Posts page size", min_value=10, max_value=100, value=100, step=10)
 
     st.header("Comments mode")
@@ -292,11 +292,7 @@ with st.sidebar:
         "How to fetch comments per post?",
         options=["preview", "all", "slice"],
         index=0,
-        help=(
-            "preview: 1 page per post\n"
-            "all: paginate all pages (capped)\n"
-            "slice: fetch a specific offset range per post (e.g., comments #20 to #40)"
-        ),
+        help="preview: 1 page per post | all: paginate | slice: fetch offsets [start,end)",
     )
     comments_page_size = st.number_input("Comments page size", min_value=20, max_value=500, value=200, step=20)
     max_comment_pages = st.number_input("Max comment pages per post (only for 'all')", min_value=1, max_value=500, value=50, step=10)
@@ -304,6 +300,10 @@ with st.sidebar:
     st.subheader("Comment slice (only for 'slice')")
     c_slice_start = st.number_input("Comment slice start (offset)", min_value=0, value=0, step=1)
     c_slice_end = st.number_input("Comment slice end (exclusive)", min_value=1, value=20, step=1)
+
+    st.header("Keep only the N most recent (GLOBAL)")
+    keep_top_n = st.checkbox("Keep only N most recent comments (global)", value=False)
+    top_n = st.number_input("N (most recent comments)", min_value=1, value=200, step=50, disabled=not keep_top_n)
 
     st.header("Performance / rate-limit")
     sleep_s = st.slider("Sleep between requests (seconds)", min_value=0.0, max_value=1.0, value=0.12, step=0.02)
@@ -318,16 +318,11 @@ with st.sidebar:
 
 run = st.button("Run", type="primary", use_container_width=True)
 
-# Containers for live progress
 posts_progress = st.progress(0, text="Posts: waiting…")
 comments_progress = st.progress(0, text="Comments: waiting…")
 status = st.empty()
-
 posts_table_ph = st.empty()
 summary_ph = st.empty()
-
-# Holders for per-post comment previews (live)
-per_post_containers: Dict[int, Tuple[st.delta_generator.DeltaGenerator, st.delta_generator.DeltaGenerator]] = {}
 
 
 def posts_progress_cb(done: int, total: int, phase: str) -> None:
@@ -336,20 +331,16 @@ def posts_progress_cb(done: int, total: int, phase: str) -> None:
 
 
 def comments_page_cb(post_id: int, page_idx: int, n_in_page: int, done: bool) -> None:
-    # Just a small per-post status line; global progress handled elsewhere.
-    if post_id in per_post_containers:
-        stat_ph, _ = per_post_containers[post_id]
-        tail = "done" if done else "…"
-        stat_ph.write(f"Comments: page {page_idx} (+{n_in_page}) {tail}")
+    # simple callback placeholder (per-post expander handles its own text)
+    pass
 
 
 def normalize_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for i, p in enumerate(posts):
-        pid = p.get("id")
         out.append({
             "idx_in_range": i,
-            "post_id": pid,
+            "post_id": p.get("id"),
             "title": safe_post_title(p),
         })
     return out
@@ -376,11 +367,25 @@ def normalize_comments(post_id: int, post_title: str, comments: List[Dict[str, A
     return out
 
 
+def dedup_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for r in rows:
+        cid = r.get("comment_id")
+        if cid is None:
+            continue
+        k = str(cid)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(r)
+    return out
+
+
 if run:
     if not token.strip():
         st.error("Token is required.")
         st.stop()
-
     if int(end_idx) <= int(start_idx):
         st.error("End index must be > Start index.")
         st.stop()
@@ -413,22 +418,17 @@ if run:
 
     status.write("Fetching comments per post…")
 
-    # Build per-post expanders & placeholders upfront (so UI is stable)
-    post_expanders: List[Tuple[int, str]] = []
+    post_list: List[Tuple[int, str]] = []
     for p in posts:
         pid = p.get("id")
-        if not isinstance(pid, int):
-            continue
-        title = safe_post_title(p)
-        post_expanders.append((pid, title))
+        if isinstance(pid, int):
+            post_list.append((pid, safe_post_title(p)))
 
-    # Global comments collection
     all_comments_rows: List[Dict[str, Any]] = []
-
-    total_posts = len(post_expanders)
+    total_posts = len(post_list)
     done_posts = 0
 
-    for pid, title in post_expanders:
+    for pid, title in post_list:
         done_posts += 1
         comments_progress.progress(
             int(min(done_posts / max(total_posts, 1), 1.0) * 100),
@@ -438,9 +438,7 @@ if run:
         with st.expander(f"Post {pid} — {title or '(no title)'}", expanded=(done_posts <= 3)):
             stat_ph = st.empty()
             table_ph = st.empty()
-            per_post_containers[pid] = (stat_ph, table_ph)
 
-            # Fetch comments (preview/all/slice)
             try:
                 comments = fetch_comments_for_post(
                     session=session,
@@ -459,10 +457,7 @@ if run:
                 stat_ph.error(f"Failed to fetch comments for post {pid}: {e}")
                 comments = []
 
-            # Normalize + show preview
             rows = normalize_comments(pid, title, comments, with_raw=bool(include_raw_json))
-            # de-dup globally by comment_id
-            # (keep it simple: dedup later for export; preview can show raw)
             preview_rows = [{
                 "comment_id": r.get("comment_id"),
                 "created_at": r.get("created_at"),
@@ -476,26 +471,27 @@ if run:
 
             all_comments_rows.extend(rows)
 
-    # Global dedup for export
-    seen = set()
-    deduped_comments: List[Dict[str, Any]] = []
-    for r in all_comments_rows:
-        cid = r.get("comment_id")
-        if cid is None:
-            continue
-        key = str(cid)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped_comments.append(r)
+    # Global dedup + sort + optional top-N
+    deduped_comments = dedup_rows(all_comments_rows)
+    deduped_comments.sort(key=created_at_utc, reverse=True)
+
+    if keep_top_n:
+        deduped_comments = deduped_comments[: int(top_n)]
 
     stats.comments_unique = len(deduped_comments)
 
-    comments_progress.progress(100, text=f"Comments: done | pages={stats.comment_pages_fetched} | seen={stats.comments_seen} | unique={stats.comments_unique}")
+    comments_progress.progress(
+        100,
+        text=(
+            f"Comments: done | pages={stats.comment_pages_fetched} | "
+            f"seen={stats.comments_seen} | unique={stats.comments_unique}"
+        ),
+    )
 
     summary_ph.info(
         f"Done. Posts requested={stats.posts_requested}, fetched={stats.posts_fetched}. "
-        f"Comment pages fetched={stats.comment_pages_fetched}, comments seen={stats.comments_seen}, unique={stats.comments_unique}."
+        f"Comment pages fetched={stats.comment_pages_fetched}, comments seen={stats.comments_seen}. "
+        f"Export rows (after dedup/sort/topN)={stats.comments_unique}."
     )
 
     # Exports
@@ -503,10 +499,9 @@ if run:
     st.subheader("Exports")
 
     posts_fields = ["idx_in_range", "post_id", "title"]
-    posts_csv = build_csv_bytes(posts_norm, posts_fields)
     st.download_button(
         "Download posts.csv",
-        data=posts_csv,
+        data=build_csv_bytes(posts_norm, posts_fields),
         file_name=f"metaculus_posts_{int(start_idx)}_{int(end_idx)}.csv",
         mime="text/csv",
         use_container_width=True,
@@ -526,17 +521,18 @@ if run:
     if include_raw_json:
         comment_fields.append("raw_json")
 
-    comments_csv = build_csv_bytes(deduped_comments, comment_fields)
+    suffix = f"top{int(top_n)}_" if keep_top_n else ""
     st.download_button(
         "Download comments.csv",
-        data=comments_csv,
-        file_name=f"metaculus_comments_posts_{int(start_idx)}_{int(end_idx)}_{mode}.csv",
+        data=build_csv_bytes(deduped_comments, comment_fields),
+        file_name=f"metaculus_comments_{suffix}posts_{int(start_idx)}_{int(end_idx)}_{mode}.csv",
         mime="text/csv",
         use_container_width=True,
     )
 else:
     st.caption(
-        "Tip: Pour récupérer les posts #20 à #40, mets Start=20, End=40. "
-        "Pour récupérer les commentaires #20 à #40 de chaque post, mets mode='slice' et Comment slice start=20, end=40."
+        "Tips: Posts #20..#40 => Start=20, End=40. "
+        "Commentaires #20..#40 par post => mode='slice', slice start=20, end=40. "
+        "Top N global => active 'Keep only N most recent comments (global)'."
     )
 
