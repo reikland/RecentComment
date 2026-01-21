@@ -655,7 +655,7 @@ with st.sidebar:
     c_slice_end = st.number_input("Comment slice end (exclusive)", min_value=1, value=20, step=1)
 
     st.header("Filters")
-    cutoff_enabled = st.checkbox("Exclude comments after cutoff date (UTC)", value=False)
+    cutoff_enabled = st.checkbox("Exclude comments before cutoff date (UTC)", value=False)
     cutoff_date = st.date_input("Cutoff date (UTC)", value=datetime.utcnow().date(), disabled=not cutoff_enabled)
     cutoff_time = st.time_input("Cutoff time (UTC)", value=datetime.utcnow().time(), disabled=not cutoff_enabled)
     st.caption("Bot filter: comments with 'bot' in the username are always removed.")
@@ -755,11 +755,24 @@ def apply_comment_filters(
             continue
         if cutoff is not None:
             created = created_at_utc(r)
-            if created > cutoff:
+            if created < cutoff:
                 removed_cutoff += 1
                 continue
         filtered.append(r)
     return filtered, removed_bots, removed_cutoff
+
+
+def is_post_closed_or_resolved(post: Dict[str, Any]) -> bool:
+    status = str(post.get("status") or "").strip().lower()
+    if status in {"closed", "resolved"}:
+        return True
+    if post.get("is_resolved") is True:
+        return True
+    if post.get("resolution") not in (None, "", {}):
+        return True
+    if post.get("resolved_at") or post.get("closed_at"):
+        return True
+    return False
 
 
 def score_rows_to_csv(
@@ -835,6 +848,7 @@ if run:
 
     status.write("Fetching comments per post…")
 
+    post_by_id = {p.get("id"): p for p in posts if isinstance(p.get("id"), int)}
     post_list: List[Tuple[int, str]] = []
     for p in posts:
         pid = p.get("id")
@@ -852,9 +866,14 @@ if run:
             text=f"Comments: {done_posts}/{total_posts} posts processed | pages={stats.comment_pages_fetched} | seen={stats.comments_seen}",
         )
 
+        post = post_by_id.get(pid, {})
         with st.expander(f"Post {pid} — {title or '(no title)'}", expanded=(done_posts <= 3)):
             stat_ph = st.empty()
             table_ph = st.empty()
+
+            if is_post_closed_or_resolved(post):
+                stat_ph.info("Post is closed or resolved; skipping comments fetch.")
+                continue
 
             try:
                 comments = fetch_comments_for_post(
@@ -914,7 +933,7 @@ if run:
     summary_ph.info(
         f"Done. Posts requested={stats.posts_requested}, fetched={stats.posts_fetched}. "
         f"Comment pages fetched={stats.comment_pages_fetched}, comments seen={stats.comments_seen}. "
-        f"Removed bots={removed_bots}, removed after cutoff={removed_cutoff}. "
+        f"Removed bots={removed_bots}, removed before cutoff={removed_cutoff}. "
         f"Export rows (after filters/topN)={stats.comments_unique}."
     )
 
