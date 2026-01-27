@@ -6,7 +6,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,173 +14,23 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import streamlit as st
 
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None  # type: ignore
+
+
 # =========================
-# API config (uses https://www.metaculus.com/api/)
+# Config (Metaculus API v1)
 # =========================
 BASE_API = "https://www.metaculus.com/api"
-POSTS_URL = f"{BASE_API}/posts/"
 COMMENTS_URL = f"{BASE_API}/comments/"
 
-POSTS_PAGE_SIZE_DEFAULT = 100
-COMMENTS_PAGE_SIZE_DEFAULT = 200
-
 REQUEST_TIMEOUT_S = 30
-MAX_RETRIES = 5
+MAX_RETRIES = 6
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MAX_COMMENT_CHARS = 2200
-PARSER_RETRIES = 3
-
-CSV_COLUMNS_SCORED = [
-    "ai_score",
-    "rationale",
-    "flags_json",
-    "evidence_urls",
-    "ts",
-    "post_id",
-    "post_title",
-    "comment_id",
-    "created_at",
-    "author_username",
-    "vote_score",
-    "parent_id",
-    "root_id",
-    "comment_text",
-]
-
-SYSTEM_PROMPT_JUDGE = """
-You are a narrow scoring module inside a larger pipeline.
-Your ONLY job is to rate Metaculus comments for quality in the AI Pathways Tournament.
-
-You are NOT a general-purpose assistant.
-Do NOT brainstorm, speculate, or explore side topics.
-Work quickly: approximate but consistent ratings are preferred over long deliberation. DO NOT THINK, FIRST FEELING IS RIGHT. OUTPUT AS FAST AS POSSIBLE.
-
-Each call is COMPLETELY INDEPENDENT.
-You NEVER see previous comments or scores.
-Treat EVERY request as a fresh, stand-alone task.
-
-OUTPUT FORMAT (STRICT, 4 LINES MAX):
-Line 1: "score = X" where X is an integer 1..6.
-Line 2: "rationale: <very short explanation, <=180 characters>".
-Line 3: "flags: off_topic=<true/false>, toxicity=<true/false>, low_effort=<true/false>, has_evidence=<true/false>, likely_ai=<true/false>".
-Line 4: "evidence_urls: [<url1>, <url2>, ...]" or "evidence_urls: []".
-
-You MUST:
-- Produce EXACTLY these 4 lines, no more and no less.
-- NO headings, NO bullet lists, NO extra explanation.
-- Any answer longer than 4 short lines is a FAILURE of your task.
-
-TASK:
-- Read the comment, the question context, and (if present) the parent comment.
-- If a parent comment is provided, treat the comment as a reply and assess:
-  - how well it answers the parent,
-  - how accurately it engages with the parent's claims,
-  - and whether it productively advances the discussion.
-- Decide on:
-  - score: integer 1..6
-  - rationale: short textual justification
-  - flags: off_topic, toxicity, low_effort, has_evidence, likely_ai
-  - evidence_urls: any http/https URLs referenced or clearly implied
-
-SCORING WEIGHTS:
-The comments should be ranked based on how well they:
-- Showcase clear, deep, and insightful reasoning, delving into the relevant mechanisms that affect the event in question. (40%)
-- Offer useful insights about the overall scenario(s), the interactions between questions, or the relationship between the questions and the scenario(s). (30%)
-- Provide valuable information and are based on the available evidence. (20%)
-- Challenge the community's prediction or assumptions held by other forecasters. (10%)
-
-ANCHOR POINTS (1–6 SCALE):
-The comments do not need to have all the following characteristics; one strong attribute can sometimes compensate for weaker ones.
-Use these anchors when deciding the score:
-
-1 = Trivial, badly written, or completely unreasonable comment with no predictive value.
-2 = Brief or slightly confused comment offering only surface value.
-3 = Good comment with rational arguments or potentially useful information.
-4 = Very good comment which explains solid reasoning in some detail and provides actionable information.
-5 = Excellent comment with meaningful analysis, presenting a deep dive of the available information and arguments, and drawing original conclusions from it.
-6 = Outstanding synthesis comment which clearly decomposes uncertainty, connects multiple questions or scenarios, and gives a compelling reason to significantly update forecasts.
-
-ADDITIONAL CONSTRAINTS:
-- Be conservative with high scores (5 and especially 6). Reserve them for comments that are clearly above the tournament median in insight and usefulness.
-- Penalize comments that are long but vague, generic, or boilerplate.
-- Penalize pure link dumps with little or no reasoning or forecast impact.
-- Toxic or uncivil comments should receive low scores and toxicity=true.
-- When in doubt between two adjacent scores, pick the lower one quickly rather than overthinking.
-
-FLAGS INTERPRETATION:
-- off_topic: true if the comment is largely unrelated to the question or the AI Pathways scenario.
-- toxicity: true if the comment is hostile, insulting, or clearly uncivil.
-- low_effort: true if the comment is very short, trivial, or adds almost nothing.
-- has_evidence: true if the comment brings specific data, references, links, or clearly factual information.
-- likely_ai: true if the comment is long, generic, and boilerplate-sounding with little specificity or real engagement.
-
-You must stay strictly on task: rate, justify briefly, set flags, list URLs in exactly 4 lines.
-""".strip()
-
-SYSTEM_PROMPT_TO_JSON = """
-You convert free-form rating text into STRICT JSON with this exact schema:
-{
-  "score": 1|2|3|4|5|6,
-  "rationale": "<string, <=180 chars>",
-  "flags": {
-    "off_topic": true|false,
-    "toxicity": true|false,
-    "low_effort": true|false,
-    "has_evidence": true|false,
-    "likely_ai": true|false
-  },
-  "evidence_urls": ["<string>", "..."]
-}
-
-HARD RULES:
-1. OUTPUT STRICT JSON ONLY.
-   - No explanations
-   - No comments
-   - No Markdown
-   - No code fences
-   - No extra keys
-   - No trailing commas
-
-2. DO NOT THINK "OUT LOUD".
-   - No chain-of-thought in the output.
-   - No meta commentary.
-
-3. If some information is missing in the raw text:
-   - Use a safe default:
-     - score: 3 if unclear
-     - rationale: ""
-     - flags: false for all unless clearly indicated
-     - evidence_urls: [] if none clearly extractable
-
-4. You MUST:
-   - Parse any explicit "score = X" or similar notation.
-   - Parse any obvious booleans for the flags.
-   - Collect any http/https URLs as evidence_urls (deduplicate).
-
-5. Final answer:
-   - ONE JSON object
-   - EXACTLY matching the schema above
-   - No natural language outside JSON.
-""".strip()
-
-FEWSHOTS_JUDGE = [
-    {"role": "user", "content": "TEXT: Thanks for sharing!"},
-    {
-        "role": "assistant",
-        "content": "score = 1\nrationale: Trivial acknowledgement only.\nflags: off_topic=false, toxicity=false, low_effort=true, has_evidence=false, likely_ai=false\nevidence_urls: []",
-    },
-    {"role": "user", "content": "TEXT: Anyone who thinks this will happen is an idiot."},
-    {
-        "role": "assistant",
-        "content": "score = 1\nrationale: Toxic with no evidence.\nflags: off_topic=false, toxicity=true, low_effort=true, has_evidence=false, likely_ai=false\nevidence_urls: []",
-    },
-    {"role": "user", "content": "TEXT: Turnout fell 3–5% vs 2020 in key counties (CSV). I estimate P(win)=0.56."},
-    {
-        "role": "assistant",
-        "content": "score = 5\nrationale: Quantified comparison with evidence pointer.\nflags: off_topic=false, toxicity=false, low_effort=false, has_evidence=true, likely_ai=false\nevidence_urls: []",
-    },
-]
+DEFAULT_PAGE_SIZE = 200
+MAX_PAGE_SIZE = 500
 
 
 # =========================
@@ -191,7 +40,7 @@ def auth_headers(token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Token {token}",
         "Accept": "application/json",
-        "User-Agent": "metaculus-streamlit-posts-comments/1.1",
+        "User-Agent": "metaculus-streamlit-recent-comments/1.1",
     }
 
 
@@ -234,34 +83,41 @@ def extract_results(payload: Any) -> List[Dict[str, Any]]:
     raise RuntimeError("Unexpected payload shape (no results list).")
 
 
-def safe_post_title(p: Dict[str, Any]) -> str:
-    for k in ("title", "question", "name", "headline"):
-        v = p.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
+def parse_iso(dt: str) -> datetime:
+    # "2026-01-17T16:29:01.551Z" -> aware
+    s = (dt or "").strip()
+    if not s:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def truncate(s: Any, n: int = 220) -> str:
-    if not isinstance(s, str):
-        return ""
-    s = s.replace("\r", " ").replace("\n", " ").strip()
-    return s if len(s) <= n else s[: n - 1] + "…"
+def comment_created_at_utc(c: Dict[str, Any]) -> datetime:
+    ca = c.get("created_at") or c.get("createdAt")
+    if isinstance(ca, str):
+        d = parse_iso(ca)
+        return d.astimezone(timezone.utc) if d.tzinfo else datetime.min.replace(tzinfo=timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def clean_text(s: Any) -> str:
     return " ".join(str(s or "").split()).strip()
 
 
-def truncate_comment(s: str, n: int = MAX_COMMENT_CHARS) -> str:
+def truncate(s: str, n: int = 220) -> str:
     s = clean_text(s)
-    return s if len(s) <= n else s[:n] + "\n\n[Comment truncated]"
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 def is_bot_username(username: Optional[str]) -> bool:
-    if not username:
-        return False
-    return "bot" in username.lower()
+    return bool(username) and ("bot" in str(username).lower())
 
 
 def build_csv_bytes(rows: List[Dict[str, Any]], fieldnames: List[str]) -> bytes:
@@ -273,802 +129,413 @@ def build_csv_bytes(rows: List[Dict[str, Any]], fieldnames: List[str]) -> bytes:
     return buf.getvalue().encode("utf-8-sig")
 
 
-def parse_iso(dt: str) -> datetime:
-    # "2026-01-17T16:29:01.551Z" -> aware
-    if dt.endswith("Z"):
-        dt = dt[:-1] + "+00:00"
-    return datetime.fromisoformat(dt)
+def pick_author_username(c: Dict[str, Any]) -> str:
+    a = c.get("author")
+    if isinstance(a, dict):
+        u = a.get("username") or a.get("name")
+        if isinstance(u, str) and u.strip():
+            return u.strip()
+    for k in ("author_username", "username", "user", "created_by_username"):
+        v = c.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
 
 
-def created_at_utc(row: Dict[str, Any]) -> datetime:
-    ca = row.get("created_at")
-    if isinstance(ca, str):
-        try:
-            return parse_iso(ca).astimezone(timezone.utc)
-        except Exception:
-            return datetime.min.replace(tzinfo=timezone.utc)
-    return datetime.min.replace(tzinfo=timezone.utc)
+def pick_post_id(c: Dict[str, Any]) -> Optional[int]:
+    for k in ("post", "post_id", "postId"):
+        v = c.get(k)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.strip().isdigit():
+            return int(v.strip())
+        if isinstance(v, dict):
+            pid = v.get("id")
+            if isinstance(pid, int):
+                return pid
+    return None
 
 
-def parse_json_relaxed(s: str) -> Any:
-    s = (s or "").strip()
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-
-    m = re.search(r"```(?:json)?\s*(.*?)\s*```", s, flags=re.DOTALL | re.IGNORECASE)
-    if m:
-        inner = m.group(1).strip()
-        try:
-            return json.loads(inner)
-        except Exception:
-            s = inner
-
-    m2 = re.search(r"\{.*\}", s, flags=re.DOTALL)
-    if m2:
-        return json.loads(m2.group(0))
-
-    raise ValueError("Could not parse JSON")
+def pick_comment_id(c: Dict[str, Any]) -> Optional[int]:
+    v = c.get("id")
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    return None
 
 
-def openrouter_headers(api_key: str, title: str) -> Dict[str, str]:
-    if not api_key:
-        raise RuntimeError("Missing OpenRouter API key.")
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Referer": "https://localhost",
-        "X-Title": title,
-        "User-Agent": "metaculus-comments-judge/1.0",
-    }
+def pick_vote_score(c: Dict[str, Any]) -> Optional[int]:
+    for k in ("vote_score", "score", "votes"):
+        v = c.get(k)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.strip():
+            try:
+                return int(float(v.strip()))
+            except Exception:
+                pass
+    return None
 
 
-def openrouter_chat(
-    api_key: str,
-    messages: List[Dict[str, str]],
-    model: str,
-    max_tokens: int,
-    title: str,
-) -> str:
-    payload = {"model": model, "messages": messages, "temperature": 0.0, "top_p": 1, "max_tokens": max_tokens}
-    last: Optional[Exception] = None
-    for k in range(3):
-        try:
-            r = requests.post(
-                OPENROUTER_URL,
-                headers=openrouter_headers(api_key, title=title),
-                json=payload,
-                timeout=120,
-            )
-            if r.status_code == 429:
-                ra = float(r.headers.get("Retry-After", "2") or 2)
-                time.sleep(min(ra, 10))
-                continue
-            r.raise_for_status()
-            data = r.json()
-            if "error" in data:
-                raise RuntimeError(str(data["error"]))
-            ch = data.get("choices") or []
-            if not ch:
-                raise RuntimeError("No choices")
-            content = (ch[0].get("message") or {}).get("content") or ""
-            if not content:
-                raise RuntimeError("Empty content")
-            return content
-        except Exception as e:
-            last = e
-            time.sleep(0.7 * (k + 1))
-    raise RuntimeError(f"OpenRouter failed: {repr(last)}")
+def pick_parent_id(c: Dict[str, Any]) -> Optional[int]:
+    for k in ("parent_id", "parent", "parent_comment", "in_reply_to"):
+        v = c.get(k)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.strip().isdigit():
+            return int(v.strip())
+    return None
 
 
-class ParserFormatError(RuntimeError):
-    pass
-
-
-def build_judge_msgs(post_title: str, comment_text: str) -> List[Dict[str, str]]:
-    user = (
-        "Rate this comment using the strict 4-line format.\n\n"
-        f"QUESTION_TITLE: {post_title}\n"
-        f"COMMENT_TEXT:\n{comment_text}\n\n"
-        "Exactly 4 lines, nothing else."
-    )
-    return [{"role": "system", "content": SYSTEM_PROMPT_JUDGE}] + FEWSHOTS_JUDGE + [{"role": "user", "content": user}]
-
-
-def normalize_parsed(obj: Any) -> Dict[str, Any]:
-    if not isinstance(obj, dict):
-        raise ParserFormatError("Not a dict")
-    for k in ("score", "rationale", "flags", "evidence_urls"):
-        if k not in obj:
-            raise ParserFormatError(f"Missing {k}")
-
-    try:
-        score = int(obj.get("score"))
-    except Exception:
-        raise ParserFormatError("Bad score")
-    if not (1 <= score <= 6):
-        raise ParserFormatError("Score out of range")
-
-    flags = obj.get("flags")
-    if not isinstance(flags, dict):
-        raise ParserFormatError("Bad flags")
-    wanted = ["off_topic", "toxicity", "low_effort", "has_evidence", "likely_ai"]
-    for k in wanted:
-        if k not in flags:
-            raise ParserFormatError(f"Missing flag {k}")
-
-    ev = obj.get("evidence_urls")
-    if not isinstance(ev, list):
-        raise ParserFormatError("Bad evidence_urls")
-
-    rationale = str(obj.get("rationale") or "")[:180]
-    norm_flags = {k: bool(flags.get(k, False)) for k in wanted}
-
-    seen, ev_out = set(), []
-    for u in ev:
-        su = str(u).strip()
-        if su and su not in seen:
-            seen.add(su)
-            ev_out.append(su)
-
-    return {"score": score, "rationale": rationale, "flags": norm_flags, "evidence_urls": ev_out}
-
-
-def parse_with_retries(api_key: str, raw_judge_text: str, parser_model: str) -> Dict[str, Any]:
-    base = [{"role": "system", "content": SYSTEM_PROMPT_TO_JSON}, {"role": "user", "content": raw_judge_text}]
-    last: Optional[Exception] = None
-    for t in range(PARSER_RETRIES):
-        try:
-            msgs = base if t == 0 else base + [{"role": "user", "content": "JSON only. Exactly the schema. No extra keys."}]
-            txt = openrouter_chat(api_key, msgs, model=parser_model, max_tokens=260, title="Parser")
-            return normalize_parsed(parse_json_relaxed(txt))
-        except Exception as e:
-            last = e
-    raise ParserFormatError(f"Parser failed after retries: {repr(last)}")
-
-
-def score_comment(
-    api_key: str,
-    judge_model: str,
-    parser_model: str,
-    post_title: str,
-    comment_text: str,
-) -> Dict[str, Any]:
-    ct = truncate_comment(comment_text, MAX_COMMENT_CHARS)
-
-    try:
-        raw = openrouter_chat(
-            api_key,
-            build_judge_msgs(post_title, ct),
-            model=judge_model,
-            max_tokens=200,
-            title="Judge",
-        )
-    except Exception:
-        raw = (
-            "score = 3\n"
-            "rationale: Judge error; default neutral.\n"
-            "flags: off_topic=false, toxicity=false, low_effort=false, has_evidence=false, likely_ai=false\n"
-            "evidence_urls: []"
-        )
-
-    return parse_with_retries(api_key, raw, parser_model)
-
-
-def now_ts() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def read_csv_rows(data: bytes) -> Tuple[List[Dict[str, Any]], List[str]]:
-    text = data.decode("utf-8-sig", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
-    return list(reader), reader.fieldnames or []
+def pick_root_id(c: Dict[str, Any]) -> Optional[int]:
+    for k in ("root_id", "root", "root_comment_id"):
+        v = c.get(k)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.strip().isdigit():
+            return int(v.strip())
+    return None
 
 
 # =========================
-# Fetch logic
+# Fetcher: global most recent comments until N or cutoff
 # =========================
 @dataclass
-class RunStats:
-    posts_requested: int = 0
-    posts_fetched: int = 0
-    comment_pages_fetched: int = 0
+class FetchStats:
+    pages_fetched: int = 0
     comments_seen: int = 0
-    comments_unique: int = 0
+    comments_kept: int = 0
+    removed_bots: int = 0
+    removed_cutoff: int = 0
+    ordering_unreliable: bool = False
 
 
-def fetch_posts_range(
+def choose_comments_order_params(
     session: requests.Session,
     headers: Dict[str, str],
-    start_index: int,
-    end_index: int,
-    posts_page_size: int,
     sleep_s: float,
-    progress_cb=None,
-) -> List[Dict[str, Any]]:
-    assert 0 <= start_index < end_index
-    needed = end_index - start_index
-    out: List[Dict[str, Any]] = []
-    offset = start_index
-    use_order_by = True
-
-    while len(out) < needed:
-        limit = min(posts_page_size, needed - len(out))
-        params: Dict[str, Any] = {"limit": limit, "offset": offset}
-        if use_order_by:
-            params["order_by"] = "-activity_at"
-
+) -> Dict[str, Any]:
+    """
+    Probe to find an ordering parameter that the deployment accepts.
+    """
+    candidates = [
+        {"sort": "-created_at"},
+        {"order_by": "-created_at"},
+        {"ordering": "-created_at"},
+        {},
+    ]
+    for cand in candidates:
         try:
-            payload = request_json(session, POSTS_URL, headers, params, sleep_s)
-        except RuntimeError as e:
-            msg = str(e)
-            if use_order_by and ("order_by" in msg or "activity_at" in msg or "400" in msg):
-                use_order_by = False
-                continue
-            raise
-
-        chunk = extract_results(payload)
-        if not chunk:
-            break
-
-        out.extend(chunk)
-        offset += limit
-        if progress_cb:
-            progress_cb(len(out), needed, phase="posts")
-
-        time.sleep(sleep_s)
-
-    return out[:needed]
+            payload = request_json(
+                session,
+                COMMENTS_URL,
+                headers,
+                params={"limit": 3, "offset": 0, **cand},
+                sleep_s=sleep_s,
+            )
+            chunk = extract_results(payload)
+            if isinstance(chunk, list):
+                return cand
+        except Exception:
+            continue
+    return {}
 
 
-def fetch_comments_for_post(
+def _chunk_is_desc_by_created_at(chunk: List[Dict[str, Any]]) -> bool:
+    dts = [comment_created_at_utc(c) for c in chunk]
+    # If any timestamp is missing/unparseable, do not trust ordering
+    if any(dt.year <= 1901 for dt in dts):
+        return False
+    return all(dts[i] >= dts[i + 1] for i in range(len(dts) - 1))
+
+
+def fetch_recent_comments_global(
     session: requests.Session,
     headers: Dict[str, str],
-    post_id: int,
-    mode: str,
+    n_wanted: int,
+    cutoff_utc: Optional[datetime],
     page_size: int,
-    max_pages: int,
     sleep_s: float,
-    slice_start: int,
-    slice_end: int,
-    stats: RunStats,
-    per_page_cb=None,
-) -> List[Dict[str, Any]]:
-    base_variants = [{"post": post_id}, {"post_id": post_id}, {"post": str(post_id)}, {"post_id": str(post_id)}]
-    order_variants = [{"sort": "-created_at"}, {"order_by": "-created_at"}, {}]
+    exclude_bots: bool,
+    progress_cb=None,
+    hard_page_cap: int = 5000,
+) -> Tuple[List[Dict[str, Any]], FetchStats]:
+    """
+    Fetch comments newest-first (global). Keep collecting until:
+      - have N comments, OR
+      - we are confident we've crossed the cutoff in a descending stream, OR
+      - no more results.
 
-    chosen_base: Optional[Dict[str, Any]] = None
-    chosen_order: Optional[Dict[str, Any]] = None
+    IMPORTANT: cutoff is enforced strictly as a filter (never include older-than-cutoff comments),
+    and the "stop when crossing cutoff" optimization is only used if ordering looks reliable.
+    """
+    stats = FetchStats()
+    order_params = choose_comments_order_params(session, headers, sleep_s=sleep_s)
 
-    for b in base_variants:
-        for o in order_variants:
-            probe_params = {"limit": 1, "offset": 0}
-            probe_params.update(b)
-            probe_params.update(o)
-            try:
-                payload = request_json(session, COMMENTS_URL, headers, probe_params, sleep_s)
-                _ = extract_results(payload)
-                chosen_base, chosen_order = b, o
-                break
-            except Exception:
-                continue
-        if chosen_base is not None:
-            break
-
-    if chosen_base is None or chosen_order is None:
-        return []
-
-    comments: List[Dict[str, Any]] = []
-
-    if mode == "slice":
-        if slice_end <= slice_start:
-            return []
-        limit = slice_end - slice_start
-        params = {"limit": min(page_size, limit), "offset": slice_start}
-        params.update(chosen_base)
-        params.update(chosen_order)
-        payload = request_json(session, COMMENTS_URL, headers, params, sleep_s)
-        chunk = extract_results(payload)
-        stats.comment_pages_fetched += 1
-        stats.comments_seen += len(chunk)
-        comments.extend(chunk)
-        if per_page_cb:
-            per_page_cb(post_id, 1, len(chunk), done=True)
-        return comments
-
-    if mode == "preview":
-        params = {"limit": page_size, "offset": 0}
-        params.update(chosen_base)
-        params.update(chosen_order)
-        payload = request_json(session, COMMENTS_URL, headers, params, sleep_s)
-        chunk = extract_results(payload)
-        stats.comment_pages_fetched += 1
-        stats.comments_seen += len(chunk)
-        comments.extend(chunk)
-        if per_page_cb:
-            per_page_cb(post_id, 1, len(chunk), done=True)
-        return comments
-
-    # mode == "all"
+    collected: List[Dict[str, Any]] = []
+    seen_ids: set[int] = set()
     offset = 0
-    for page_idx in range(1, max_pages + 1):
-        params = {"limit": page_size, "offset": offset}
-        params.update(chosen_base)
-        params.update(chosen_order)
 
-        payload = request_json(session, COMMENTS_URL, headers, params, sleep_s)
+    page_size = max(20, min(int(page_size), MAX_PAGE_SIZE))
+    n_wanted = max(1, int(n_wanted))
+
+    while len(collected) < n_wanted and stats.pages_fetched < hard_page_cap:
+        params: Dict[str, Any] = {"limit": page_size, "offset": offset}
+        params.update(order_params)
+
+        payload = request_json(session, COMMENTS_URL, headers, params=params, sleep_s=sleep_s)
         chunk = extract_results(payload)
 
-        stats.comment_pages_fetched += 1
+        stats.pages_fetched += 1
         stats.comments_seen += len(chunk)
 
         if not chunk:
-            if per_page_cb:
-                per_page_cb(post_id, page_idx, 0, done=True)
             break
 
-        comments.extend(chunk)
-        offset += page_size
+        # Detect weird pagination loops
+        ids_in_chunk = [pick_comment_id(c) for c in chunk if pick_comment_id(c) is not None]
+        if ids_in_chunk and all(int(cid) in seen_ids for cid in ids_in_chunk if cid is not None):
+            break
 
-        if per_page_cb:
-            per_page_cb(post_id, page_idx, len(chunk), done=False)
+        # Ordering reliability (for cutoff early stop only)
+        is_desc = _chunk_is_desc_by_created_at(chunk)
+        if not is_desc:
+            stats.ordering_unreliable = True
 
+        # Process chunk, always enforcing cutoff as a filter (never include older)
+        oldest_dt_in_chunk = None
+        for c in chunk:
+            cid = pick_comment_id(c)
+            if cid is None:
+                continue
+            if int(cid) in seen_ids:
+                continue
+            seen_ids.add(int(cid))
+
+            created = comment_created_at_utc(c)
+            if oldest_dt_in_chunk is None or created < oldest_dt_in_chunk:
+                oldest_dt_in_chunk = created
+
+            if cutoff_utc is not None and created < cutoff_utc:
+                stats.removed_cutoff += 1
+                continue  # strict filter: never include
+
+            author_username = pick_author_username(c)
+            if exclude_bots and is_bot_username(author_username):
+                stats.removed_bots += 1
+                continue
+
+            collected.append(c)
+            stats.comments_kept += 1
+            if len(collected) >= n_wanted:
+                break
+
+        if progress_cb:
+            progress_cb(stats, len(collected), n_wanted)
+
+        # Early stop only if ordering looks reliable and the oldest element in chunk is < cutoff
+        if cutoff_utc is not None and is_desc and oldest_dt_in_chunk is not None and oldest_dt_in_chunk < cutoff_utc:
+            break
+
+        # Next page
+        offset += len(chunk)
         time.sleep(sleep_s)
 
-    return comments
+    return collected[:n_wanted], stats
 
 
 # =========================
 # Streamlit app
 # =========================
-st.set_page_config(page_title="Metaculus: Posts + Comments (API)", layout="wide")
-st.title("Metaculus — Posts & Comments (via https://www.metaculus.com/api/)")
+st.set_page_config(page_title="Metaculus — Recent Comments Fetcher", layout="wide")
+st.title("Metaculus — Recent Comments Fetcher (global, newest-first)")
+
+# Stable defaults (avoid auto-updating cutoff time on rerun)
+if "cutoff_enabled" not in st.session_state:
+    st.session_state["cutoff_enabled"] = True
+if "cutoff_tz" not in st.session_state:
+    st.session_state["cutoff_tz"] = "Europe/Paris"
+if "cutoff_date" not in st.session_state:
+    st.session_state["cutoff_date"] = datetime.utcnow().date()
+if "cutoff_time" not in st.session_state:
+    # freeze the initial default; user edits persist thereafter
+    st.session_state["cutoff_time"] = datetime.utcnow().time().replace(microsecond=0)
+if "exclude_bots" not in st.session_state:
+    st.session_state["exclude_bots"] = True
+
+
+def compute_cutoff_utc(enabled: bool, d, t, tz_choice: str) -> Optional[datetime]:
+    if not enabled:
+        return None
+    naive = datetime.combine(d, t)
+    if tz_choice == "UTC":
+        return naive.replace(tzinfo=timezone.utc)
+    # Europe/Paris
+    if ZoneInfo is None:
+        # Cannot do correct tz conversion without zoneinfo; fallback to UTC interpretation
+        return naive.replace(tzinfo=timezone.utc)
+    try:
+        loc = naive.replace(tzinfo=ZoneInfo("Europe/Paris"))  # type: ignore[arg-type]
+        return loc.astimezone(timezone.utc)
+    except Exception:
+        return naive.replace(tzinfo=timezone.utc)
+
 
 with st.sidebar:
     st.header("Auth")
-    token = st.text_input("Metaculus API token", type="password", help="Required for authenticated API access.")
+    token = st.text_input("Metaculus API token", type="password")
 
-    st.header("Judge (OpenRouter)")
-    openrouter_key = st.text_input("OpenRouter API key", type="password")
-    judge_model = st.text_input("Judge model ID", placeholder="e.g. openai/gpt-4.1")
-    parser_model = st.text_input("Parser model ID", placeholder="e.g. openai/gpt-4o-mini")
+    st.header("Target")
+    n_wanted = st.number_input("N most recent comments to collect", min_value=1, max_value=5000, value=200, step=50)
 
-    st.header("Posts selection (raw index range)")
-    start_idx = st.number_input("Start index (inclusive)", min_value=0, value=0, step=1)
-    end_idx = st.number_input("End index (exclusive)", min_value=1, value=40, step=1)
-    posts_page_size = st.number_input("Posts page size", min_value=10, max_value=100, value=100, step=10)
-
-    st.header("Comments mode")
-    mode = st.selectbox(
-        "How to fetch comments per post?",
-        options=["preview", "all", "slice"],
-        index=0,
-        help="preview: 1 page per post | all: paginate | slice: fetch offsets [start,end)",
+    st.header("Cutoff (strict filter + stop when crossed)")
+    cutoff_enabled = st.checkbox("Enable cutoff", key="cutoff_enabled")
+    cutoff_tz = st.selectbox(
+        "Cutoff timezone",
+        options=["UTC", "Europe/Paris"],
+        key="cutoff_tz",
+        disabled=not cutoff_enabled,
+        help="Cutoff is converted to UTC before filtering (if zoneinfo is available).",
     )
-    comments_page_size = st.number_input("Comments page size", min_value=20, max_value=500, value=200, step=20)
-    max_comment_pages = st.number_input("Max comment pages per post (only for 'all')", min_value=1, max_value=500, value=50, step=10)
 
-    st.subheader("Comment slice (only for 'slice')")
-    c_slice_start = st.number_input("Comment slice start (offset)", min_value=0, value=0, step=1)
-    c_slice_end = st.number_input("Comment slice end (exclusive)", min_value=1, value=20, step=1)
+    cutoff_date = st.date_input("Cutoff date", key="cutoff_date", disabled=not cutoff_enabled)
+    cutoff_time = st.time_input("Cutoff time", key="cutoff_time", disabled=not cutoff_enabled)
 
-    st.header("Filters")
-    cutoff_enabled = st.checkbox("Exclude comments before cutoff date (UTC)", value=False)
-    cutoff_date = st.date_input("Cutoff date (UTC)", value=datetime.utcnow().date(), disabled=not cutoff_enabled)
-    cutoff_time = st.time_input("Cutoff time (UTC)", value=datetime.utcnow().time(), disabled=not cutoff_enabled)
-    st.caption("Bot filter: comments with 'bot' in the username are always removed.")
+    if cutoff_enabled and cutoff_tz == "Europe/Paris" and ZoneInfo is None:
+        st.warning("zoneinfo unavailable in this environment; cutoff will be interpreted as UTC (approximation).")
 
-    st.header("Keep only the N most recent (GLOBAL)")
-    keep_top_n = st.checkbox("Keep only N most recent comments (global)", value=False)
-    top_n = st.number_input("N (most recent comments)", min_value=1, value=200, step=50, disabled=not keep_top_n)
-
-    st.header("Performance / rate-limit")
+    st.header("Pagination / rate-limit")
+    page_size = st.number_input("Page size", min_value=20, max_value=MAX_PAGE_SIZE, value=DEFAULT_PAGE_SIZE, step=20)
     sleep_s = st.slider("Sleep between requests (seconds)", min_value=0.0, max_value=1.0, value=0.12, step=0.02)
 
-    st.header("UI")
-    preview_posts_rows = st.number_input("Posts preview rows", min_value=5, max_value=200, value=50, step=5)
-    preview_comments_rows = st.number_input("Comments preview rows per post", min_value=3, max_value=50, value=8, step=1)
-
-    st.header("Export")
-    include_raw_json = st.checkbox("Include raw_json column in comments CSV", value=False)
+    st.header("Filters")
+    exclude_bots = st.checkbox("Exclude usernames containing 'bot'", key="exclude_bots", value=True)
 
 
-run = st.button("Run", type="primary", use_container_width=True)
+run = st.button("Fetch recent comments", type="primary", use_container_width=True)
 
-posts_progress = st.progress(0, text="Posts: waiting…")
-comments_progress = st.progress(0, text="Comments: waiting…")
+prog = st.progress(0, text="Waiting…")
 status = st.empty()
-posts_table_ph = st.empty()
+preview_ph = st.empty()
 summary_ph = st.empty()
 
 
-def posts_progress_cb(done: int, total: int, phase: str) -> None:
-    pct = int(min(done / max(total, 1), 1.0) * 100)
-    posts_progress.progress(pct, text=f"Posts: {done}/{total} fetched")
-
-
-def comments_page_cb(post_id: int, page_idx: int, n_in_page: int, done: bool) -> None:
-    # simple callback placeholder (per-post expander handles its own text)
-    pass
-
-
-def normalize_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = []
-    for i, p in enumerate(posts):
-        out.append({
-            "idx_in_range": i,
-            "post_id": p.get("id"),
-            "title": safe_post_title(p),
-        })
-    return out
-
-
-def normalize_comments(post_id: int, post_title: str, comments: List[Dict[str, Any]], with_raw: bool) -> List[Dict[str, Any]]:
-    out = []
-    for c in comments:
-        author = c.get("author") if isinstance(c.get("author"), dict) else {}
-        row = {
-            "post_id": post_id,
-            "post_title": post_title,
-            "comment_id": c.get("id"),
-            "created_at": c.get("created_at"),
-            "author_username": author.get("username") if isinstance(author, dict) else None,
-            "vote_score": c.get("vote_score"),
-            "parent_id": c.get("parent_id"),
-            "root_id": c.get("root_id"),
-            "text": c.get("text"),
-        }
-        if with_raw:
-            row["raw_json"] = json.dumps(c, ensure_ascii=False)
-        out.append(row)
-    return out
-
-
-def dedup_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    out = []
-    for r in rows:
-        cid = r.get("comment_id")
-        if cid is None:
-            continue
-        k = str(cid)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(r)
-    return out
-
-
-def apply_comment_filters(
-    rows: List[Dict[str, Any]],
-    cutoff: Optional[datetime],
-) -> Tuple[List[Dict[str, Any]], int, int]:
-    filtered = []
-    removed_bots = 0
-    removed_cutoff = 0
-    for r in rows:
-        username = r.get("author_username")
-        if is_bot_username(username):
-            removed_bots += 1
-            continue
-        if cutoff is not None:
-            created = created_at_utc(r)
-            if created < cutoff:
-                removed_cutoff += 1
-                continue
-        filtered.append(r)
-    return filtered, removed_bots, removed_cutoff
-
-
-def is_post_closed_or_resolved(post: Dict[str, Any]) -> bool:
-    status = str(post.get("status") or "").strip().lower()
-    if status in {"closed", "resolved"}:
-        return True
-    if post.get("is_resolved") is True:
-        return True
-    if post.get("resolution") not in (None, "", {}):
-        return True
-    if post.get("resolved_at") or post.get("closed_at"):
-        return True
-    return False
-
-
-def score_rows_to_csv(
-    rows: List[Dict[str, Any]],
-    api_key: str,
-    judge_model: str,
-    parser_model: str,
-    status_ph: st.delta_generator.DeltaGenerator,
-    progress_ph: st.delta_generator.DeltaGenerator,
-) -> bytes:
-    scored_rows: List[Dict[str, Any]] = []
-    total = len(rows)
-    for idx, row in enumerate(rows, 1):
-        post_title = clean_text(row.get("post_title") or row.get("post_name") or "") or f"Post {row.get('post_id')}"
-        comment_text = clean_text(row.get("text") or row.get("comment_text") or "")
-        if not comment_text:
-            continue
-        status_ph.info(f"Scoring {idx}/{total} — post_id={row.get('post_id')} comment_id={row.get('comment_id')}")
-        parsed = score_comment(api_key, judge_model, parser_model, post_title, comment_text)
-        scored_rows.append({
-            "ai_score": int(parsed["score"]),
-            "rationale": parsed.get("rationale", ""),
-            "flags_json": json.dumps(parsed.get("flags") or {}, ensure_ascii=False),
-            "evidence_urls": ";".join(parsed.get("evidence_urls") or []),
-            "ts": now_ts(),
-            "post_id": row.get("post_id"),
-            "post_title": post_title,
-            "comment_id": row.get("comment_id"),
-            "created_at": row.get("created_at"),
-            "author_username": row.get("author_username"),
-            "vote_score": row.get("vote_score"),
-            "parent_id": row.get("parent_id"),
-            "root_id": row.get("root_id"),
-            "comment_text": comment_text,
-        })
-        progress_ph.progress(min(idx / max(total, 1), 1.0))
-    return build_csv_bytes(scored_rows, CSV_COLUMNS_SCORED)
+def normalize_comment_row(c: Dict[str, Any]) -> Dict[str, Any]:
+    created_dt = comment_created_at_utc(c)
+    created_s = created_dt.isoformat().replace("+00:00", "Z") if created_dt.tzinfo else str(c.get("created_at") or "")
+    author_username = pick_author_username(c)
+    text = clean_text(c.get("text") or c.get("comment_text") or "")
+    return {
+        "comment_id": pick_comment_id(c),
+        "created_at": created_s,
+        "author_username": author_username,
+        "vote_score": pick_vote_score(c),
+        "post_id": pick_post_id(c),
+        "parent_id": pick_parent_id(c),
+        "root_id": pick_root_id(c),
+        "comment_text": text,
+        "snippet": truncate(text, 240),
+        "raw_json": json.dumps(c, ensure_ascii=False),
+    }
 
 
 if run:
     if not token.strip():
         st.error("Token is required.")
         st.stop()
-    if int(end_idx) <= int(start_idx):
-        st.error("End index must be > Start index.")
-        st.stop()
+
+    cutoff_utc = compute_cutoff_utc(cutoff_enabled, cutoff_date, cutoff_time, cutoff_tz)
+
+    # Display cutoff in both tz + UTC for sanity
+    if cutoff_enabled:
+        naive = datetime.combine(cutoff_date, cutoff_time)
+        if cutoff_tz == "Europe/Paris" and ZoneInfo is not None:
+            local = naive.replace(tzinfo=ZoneInfo("Europe/Paris"))  # type: ignore[arg-type]
+            local_s = local.isoformat()
+        elif cutoff_tz == "UTC":
+            local_s = naive.replace(tzinfo=timezone.utc).isoformat()
+        else:
+            local_s = naive.isoformat() + " (naive)"
+        status.info(f"Cutoff local: {local_s} | cutoff UTC: {cutoff_utc.isoformat().replace('+00:00','Z') if cutoff_utc else '(none)'}")
 
     session = requests.Session()
     headers = auth_headers(token.strip())
 
-    stats = RunStats(posts_requested=int(end_idx - start_idx))
-    status.write("Fetching posts…")
+    def progress_cb(stats: FetchStats, kept: int, target: int) -> None:
+        pct = int(min(kept / max(1, target), 1.0) * 100)
+        warn = " | ordering_unreliable=true" if stats.ordering_unreliable else ""
+        prog.progress(
+            pct,
+            text=(
+                f"Kept {kept}/{target} | pages={stats.pages_fetched} seen={stats.comments_seen} "
+                f"bots_removed={stats.removed_bots} cutoff_removed={stats.removed_cutoff}{warn}"
+            ),
+        )
 
     try:
-        posts = fetch_posts_range(
+        comments, stats = fetch_recent_comments_global(
             session=session,
             headers=headers,
-            start_index=int(start_idx),
-            end_index=int(end_idx),
-            posts_page_size=int(posts_page_size),
+            n_wanted=int(n_wanted),
+            cutoff_utc=cutoff_utc,
+            page_size=int(page_size),
             sleep_s=float(sleep_s),
-            progress_cb=posts_progress_cb,
+            exclude_bots=bool(exclude_bots),
+            progress_cb=progress_cb,
         )
     except Exception as e:
-        st.error(f"Failed to fetch posts: {e}")
+        st.error(f"Fetch failed: {e}")
         st.stop()
 
-    stats.posts_fetched = len(posts)
+    rows = [normalize_comment_row(c) for c in comments]
 
-    posts_norm = normalize_posts(posts)
-    posts_table_ph.dataframe(posts_norm[: int(preview_posts_rows)], use_container_width=True)
-    posts_progress.progress(100, text=f"Posts: {len(posts)}/{stats.posts_requested} fetched")
+    # Extra safety: strict post-filter for cutoff (in case of any upstream parse anomalies)
+    if cutoff_utc is not None:
+        kept2 = []
+        for r in rows:
+            dt = parse_iso(str(r.get("created_at") or ""))
+            if dt.astimezone(timezone.utc) >= cutoff_utc:
+                kept2.append(r)
+        rows = kept2
 
-    status.write("Fetching comments per post…")
+    prog.progress(100, text=f"Done. Kept {len(rows)}/{int(n_wanted)} (or hit cutoff / exhausted).")
 
-    post_by_id = {p.get("id"): p for p in posts if isinstance(p.get("id"), int)}
-    post_list: List[Tuple[int, str]] = []
-    for p in posts:
-        pid = p.get("id")
-        if isinstance(pid, int):
-            post_list.append((pid, safe_post_title(p)))
-
-    all_comments_rows: List[Dict[str, Any]] = []
-    total_posts = len(post_list)
-    done_posts = 0
-
-    for pid, title in post_list:
-        done_posts += 1
-        comments_progress.progress(
-            int(min(done_posts / max(total_posts, 1), 1.0) * 100),
-            text=f"Comments: {done_posts}/{total_posts} posts processed | pages={stats.comment_pages_fetched} | seen={stats.comments_seen}",
-        )
-
-        post = post_by_id.get(pid, {})
-        with st.expander(f"Post {pid} — {title or '(no title)'}", expanded=(done_posts <= 3)):
-            stat_ph = st.empty()
-            table_ph = st.empty()
-
-            if is_post_closed_or_resolved(post):
-                stat_ph.info("Post is closed or resolved; skipping comments fetch.")
-                continue
-
-            try:
-                comments = fetch_comments_for_post(
-                    session=session,
-                    headers=headers,
-                    post_id=pid,
-                    mode=mode,
-                    page_size=int(comments_page_size),
-                    max_pages=int(max_comment_pages),
-                    sleep_s=float(sleep_s),
-                    slice_start=int(c_slice_start),
-                    slice_end=int(c_slice_end),
-                    stats=stats,
-                    per_page_cb=comments_page_cb,
-                )
-            except Exception as e:
-                stat_ph.error(f"Failed to fetch comments for post {pid}: {e}")
-                comments = []
-
-            rows = normalize_comments(pid, title, comments, with_raw=bool(include_raw_json))
-            preview_rows = [{
-                "comment_id": r.get("comment_id"),
-                "created_at": r.get("created_at"),
-                "author_username": r.get("author_username"),
-                "vote_score": r.get("vote_score"),
-                "text_snippet": truncate(r.get("text"), 240),
-            } for r in rows[: int(preview_comments_rows)]]
-
-            stat_ph.write(f"Fetched {len(comments)} comments (mode={mode}).")
-            table_ph.dataframe(preview_rows, use_container_width=True)
-
-            all_comments_rows.extend(rows)
-
-    # Global dedup + sort + filters + optional top-N
-    deduped_comments = dedup_rows(all_comments_rows)
-    deduped_comments.sort(key=created_at_utc, reverse=True)
-
-    cutoff_dt = None
-    if cutoff_enabled:
-        cutoff_dt = datetime.combine(cutoff_date, cutoff_time, tzinfo=timezone.utc)
-
-    filtered_comments, removed_bots, removed_cutoff = apply_comment_filters(deduped_comments, cutoff=cutoff_dt)
-
-    if keep_top_n:
-        filtered_comments = filtered_comments[: int(top_n)]
-
-    stats.comments_unique = len(filtered_comments)
-
-    comments_progress.progress(
-        100,
-        text=(
-            f"Comments: done | pages={stats.comment_pages_fetched} | "
-            f"seen={stats.comments_seen} | unique={stats.comments_unique}"
-        ),
-    )
-
+    cutoff_txt = cutoff_utc.isoformat().replace("+00:00", "Z") if cutoff_utc else "(none)"
     summary_ph.info(
-        f"Done. Posts requested={stats.posts_requested}, fetched={stats.posts_fetched}. "
-        f"Comment pages fetched={stats.comment_pages_fetched}, comments seen={stats.comments_seen}. "
-        f"Removed bots={removed_bots}, removed before cutoff={removed_cutoff}. "
-        f"Export rows (after filters/topN)={stats.comments_unique}."
+        f"Result: kept={len(rows)} target={int(n_wanted)} | cutoff_utc={cutoff_txt} | "
+        f"pages={stats.pages_fetched} seen={stats.comments_seen} | "
+        f"bots_removed={stats.removed_bots} cutoff_removed={stats.removed_cutoff} | "
+        f"ordering_unreliable={stats.ordering_unreliable}"
     )
 
-    # Exports
-    st.divider()
-    st.subheader("Exports")
+    st.subheader("Preview")
+    preview_cols = ["comment_id", "created_at", "author_username", "vote_score", "post_id", "snippet"]
+    preview_ph.dataframe([{k: r.get(k) for k in preview_cols} for r in rows[:200]], use_container_width=True, height=420)
 
-    posts_fields = ["idx_in_range", "post_id", "title"]
-    st.download_button(
-        "Download posts.csv",
-        data=build_csv_bytes(posts_norm, posts_fields),
-        file_name=f"metaculus_posts_{int(start_idx)}_{int(end_idx)}.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    comment_fields = [
-        "post_id",
-        "post_title",
-        "comment_id",
-        "created_at",
-        "author_username",
-        "vote_score",
-        "parent_id",
-        "root_id",
-        "text",
-    ]
-    if include_raw_json:
-        comment_fields.append("raw_json")
-
-    suffix = f"top{int(top_n)}_" if keep_top_n else ""
+    st.subheader("Downloads")
+    csv_fields = ["comment_id", "created_at", "author_username", "vote_score", "post_id", "parent_id", "root_id", "comment_text"]
     st.download_button(
         "Download comments.csv",
-        data=build_csv_bytes(filtered_comments, comment_fields),
-        file_name=f"metaculus_comments_{suffix}posts_{int(start_idx)}_{int(end_idx)}_{mode}.csv",
+        data=build_csv_bytes(rows, csv_fields),
+        file_name="metaculus_recent_comments.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
-    st.subheader("Judge (OpenRouter)")
-    st.caption("Optionally score fetched comments or a CSV export with the judge prompts.")
-
-    if openrouter_key and judge_model.strip() and parser_model.strip():
-        score_status = st.empty()
-        score_progress = st.progress(0.0, text="Judge: waiting…")
-
-        if st.button("Score fetched comments with judge", use_container_width=True):
-            if not filtered_comments:
-                st.warning("No comments available to score.")
-            else:
-                scored_bytes = score_rows_to_csv(
-                    filtered_comments,
-                    api_key=openrouter_key.strip(),
-                    judge_model=judge_model.strip(),
-                    parser_model=parser_model.strip(),
-                    status_ph=score_status,
-                    progress_ph=score_progress,
-                )
-                st.download_button(
-                    "Download scored comments CSV",
-                    data=scored_bytes,
-                    file_name="metaculus_comments_scored.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-    else:
-        st.info("Enter OpenRouter API key + model IDs to enable judging.")
-else:
-    st.caption(
-        "Tips: Posts #20..#40 => Start=20, End=40. "
-        "Commentaires #20..#40 par post => mode='slice', slice start=20, end=40. "
-        "Top N global => active 'Keep only N most recent comments (global)'."
+    st.download_button(
+        "Download comments.json",
+        data=json.dumps(rows, ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name="metaculus_recent_comments.json",
+        mime="application/json",
+        use_container_width=True,
     )
 
-st.divider()
-st.subheader("Judge an existing comments CSV")
-st.caption("Upload a comments.csv export, then score it with the same judge prompts.")
+    with st.expander("Raw (first 5 comments)", expanded=False):
+        st.code("\n\n".join(r.get("raw_json", "") for r in rows[:5]) or "(empty)")
+else:
+    st.caption(
+        "Cutoff inputs are persisted in session_state (they do not auto-reset to current time on reruns). "
+        "Cutoff is enforced as a strict filter; early-stop on cutoff is only used when ordering looks reliable."
+    )
 
-csv_upload = st.file_uploader("Upload comments CSV", type=["csv"])
-if csv_upload is not None:
-    csv_rows, csv_fields = read_csv_rows(csv_upload.getvalue())
-    if not csv_rows:
-        st.warning("Uploaded CSV is empty.")
-    else:
-        st.write(f"Rows detected: {len(csv_rows)}")
-        cols = ["(none)"] + csv_fields
-        default_text = "text" if "text" in csv_fields else (csv_fields[0] if csv_fields else "(none)")
-        default_title = "post_title" if "post_title" in csv_fields else "(none)"
-        default_user = "author_username" if "author_username" in csv_fields else "(none)"
-        default_created = "created_at" if "created_at" in csv_fields else "(none)"
-
-        col_text = st.selectbox("comment text column", options=cols, index=cols.index(default_text) if default_text in cols else 0)
-        col_title = st.selectbox("post title column", options=cols, index=cols.index(default_title) if default_title in cols else 0)
-        col_user = st.selectbox("author username column", options=cols, index=cols.index(default_user) if default_user in cols else 0)
-        col_created = st.selectbox("created_at column", options=cols, index=cols.index(default_created) if default_created in cols else 0)
-
-        if st.button("Score uploaded CSV with judge", use_container_width=True):
-            if not openrouter_key or not judge_model.strip() or not parser_model.strip():
-                st.error("Provide OpenRouter API key + judge + parser model IDs.")
-            elif col_text == "(none)":
-                st.error("Select a comment text column.")
-            else:
-                mapped_rows = []
-                for r in csv_rows:
-                    mapped_rows.append({
-                        "post_id": r.get("post_id"),
-                        "post_title": r.get(col_title) if col_title != "(none)" else "",
-                        "comment_id": r.get("comment_id"),
-                        "created_at": r.get(col_created) if col_created != "(none)" else None,
-                        "author_username": r.get(col_user) if col_user != "(none)" else None,
-                        "vote_score": r.get("vote_score"),
-                        "parent_id": r.get("parent_id"),
-                        "root_id": r.get("root_id"),
-                        "text": r.get(col_text),
-                    })
-
-                cutoff_dt = None
-                if cutoff_enabled:
-                    cutoff_dt = datetime.combine(cutoff_date, cutoff_time, tzinfo=timezone.utc)
-                filtered_rows, _, _ = apply_comment_filters(mapped_rows, cutoff=cutoff_dt)
-
-                score_status = st.empty()
-                score_progress = st.progress(0.0, text="Judge: scoring…")
-                scored_bytes = score_rows_to_csv(
-                    filtered_rows,
-                    api_key=openrouter_key.strip(),
-                    judge_model=judge_model.strip(),
-                    parser_model=parser_model.strip(),
-                    status_ph=score_status,
-                    progress_ph=score_progress,
-                )
-                st.download_button(
-                    "Download scored CSV",
-                    data=scored_bytes,
-                    file_name="comments_scored.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
